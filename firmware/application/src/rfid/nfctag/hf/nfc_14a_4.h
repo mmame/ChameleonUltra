@@ -59,6 +59,8 @@ typedef struct __attribute__((packed)) {
     uint8_t  m_resp_buf[NFC_14A_4_MAX_APDU];
     uint16_t m_resp_len;
     bool     m_response_ready;
+    bool     m_waiting_host;   /* APDU forwarded to host, response not yet sent */
+    uint32_t m_wait_start;     /* app_timer ticks when the APDU was forwarded */
 }
 nfc_tag_14a_4_tcl_state_t;
 
@@ -82,6 +84,13 @@ void nfc_tag_14a_4_clear_static_responses(void);
 /* APDU relay — host-driven responses */
 bool nfc_tag_14a_4_get_pending_apdu(uint8_t *buf, uint16_t *length);
 void nfc_tag_14a_4_set_response(const uint8_t *data, uint16_t length);
+
+/* How long the host may take to answer a relayed APDU (the card keeps the reader alive with
+ * WTX meanwhile) and the WTXM value requested from the reader. After the timeout the card
+ * answers with status word 6F00. Defaults: 10000 ms, WTXM 59. */
+#define NFC_14A_4_DEFAULT_HOST_TIMEOUT_MS  10000
+#define NFC_14A_4_DEFAULT_WTXM             59
+void nfc_tag_14a_4_set_host_timeout(uint16_t timeout_ms, uint8_t wtxm);
 
 /* Reset handler */
 void nfc_tag_14a_4_reset_state(nfc_tag_14a_4_tcl_state_t *m_tcl_session_state);

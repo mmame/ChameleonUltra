@@ -195,6 +195,7 @@
 #define DATA_CMD_HF14A_4_STATIC_RESP            (6003)  /* add/clear static APDU response pair */
 #define DATA_CMD_HF14A_4_READER_APDU            (6004)  /* select+RATS+send APDU, keep field   */
 #define DATA_CMD_HF14A_4_EMV_SCAN               (6005)  /* full EMV scan in one call            */
+#define DATA_CMD_HF14A_4_SET_HOST_TIMEOUT       (6011)  /* host answer timeout, WTXM, SPI APDU push */
 
 #define DATA_CMD_EM410X_SET_EMU_ID              (5000)
 #define DATA_CMD_EM410X_GET_EMU_ID              (5001)

@@ -4,6 +4,9 @@
 #include "usb_main.h"
 #include "rfid_main.h"
 #include "ble_main.h"
+#ifdef CHAMELEON_SPI_TRANSPORT
+#include "spi_main.h"
+#endif
 #include "syssleep.h"
 #include "hex_utils.h"
 #include "data_cmd.h"
@@ -2605,6 +2608,20 @@ static data_frame_tx_t *cmd_processor_hf14a_4_apdu_send(uint16_t cmd, uint16_t s
 }
 
 /**
+ * HF14A-4 host answer timeout.
+ * payload: timeout_ms(2, BE; 0 = default 10000) [wtxm(1, 1..59; 0 = default 59)] [apdu_push(1)]
+ * apdu_push=1 (SPI builds): relayed APDUs are pushed as an unsolicited HF14A_4_APDU_RECV frame (IRQ high).
+ */
+static data_frame_tx_t *cmd_processor_hf14a_4_set_host_timeout(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length < 2) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    nfc_tag_14a_4_set_host_timeout(((uint16_t)data[0] << 8) | data[1], length >= 3 ? data[2] : 0);
+#ifdef CHAMELEON_SPI_TRANSPORT
+    spi_set_apdu_push(length >= 4 && data[3] != 0);
+#endif
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
+/**
  * HF14A-4 set anti-collision data (UID/ATQA/SAK/ATS).
  * payload: uid_len(1) uid(n) atqa(2) sak(1) ats_len(1) ats(m)
  */
@@ -3394,6 +3411,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF14A_4_STATIC_RESP,            NULL,                        cmd_processor_hf14a_4_static_resp,           NULL                   },
     {    DATA_CMD_HF14A_4_READER_APDU,            before_hf_reader_run,        cmd_processor_hf14a_4_reader_apdu,           NULL                   },
     {    DATA_CMD_HF14A_4_EMV_SCAN,               before_hf_reader_run,        cmd_processor_hf14a_4_emv_scan,              NULL                   },
+    {    DATA_CMD_HF14A_4_SET_HOST_TIMEOUT,       NULL,                        cmd_processor_hf14a_4_set_host_timeout,      NULL                   },
     {    6010,                                     NULL,                        cmd_processor_hf14a_4_debug_counters,        NULL                   },
     /* HF14A scan keeping field alive */
     {    DATA_CMD_HF14A_SCAN_KEEP,                before_hf_reader_run,        cmd_processor_hf14a_scan_keep,               NULL                   },
@@ -3419,6 +3437,13 @@ data_frame_tx_t *cmd_processor_get_device_capabilities(uint16_t cmd, uint16_t st
 static void auto_response_data(data_frame_tx_t *resp) {
     // TODO Please select the reply source automatically according to the message source,
     //  and do not reply by checking the validity of the link layer by layer
+#ifdef CHAMELEON_SPI_TRANSPORT
+    if (spi_request_pending()) {
+        spi_data_response(resp->buffer, resp->length);
+        spi_request_clear();
+        return;
+    }
+#endif
     if (is_usb_working()) {
         usb_cdc_write(resp->buffer, resp->length);
     } else if (is_nus_working()) {
@@ -3468,4 +3493,8 @@ void on_data_frame_received(uint16_t cmd, uint16_t status, uint16_t length, uint
         auto_response_data(response);
         NRF_LOG_INFO("Data frame cmd invalid: %d,", cmd);
     }
+#ifdef CHAMELEON_SPI_TRANSPORT
+    // commands without a response must not leave the SPI request open
+    spi_request_clear();
+#endif
 }

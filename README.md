@@ -2,6 +2,28 @@
 
 ![ultra picture](docs/images/ultra-overview.png)
 
+# Differences from upstream (mmame fork)
+
+This fork adds an SPI slave transport, so a host MCU (e.g. an ESP32) can control the device
+without USB, and makes the ISO14443-4 APDU relay more robust. Everything else is upstream.
+
+* **SPI transport** (`firmware/application/src/spi_main.c`), build with `make SPI_TRANSPORT=1`.
+  nRF52840 is SPIS2 slave (mode 0, MSB first), carrying the normal Chameleon data frames next to USB/BLE.
+  A command is one write transaction starting with a frame (`0x11`); the response is
+  clocked out by a read transaction (MOSI all `0x00`) after the IRQ pin went high.
+  Default pins: SCK P0.03, MOSI P0.05, MISO P0.07, CSN P0.14, IRQ P0.16
+  (override with `-DSPI_PIN_SCK=...` etc.). `SPI_NO_SLEEP=1` disables System OFF,
+  because SPI cannot wake the chip. Card data stays in RAM unless `SLOT_DATA_CONFIG_SAVE` is sent.
+* **ISO14443-4 relay timeout**: while the host has not answered a relayed APDU the card now
+  keeps the reader alive with repeated WTX and answers `6F00` after a configurable host timeout
+  (default 10 s, WTXM 59). Late host answers are dropped. New command
+  `HF14A_4_SET_HOST_TIMEOUT` (6011): `timeout_ms(2, BE) [wtxm(1)] [apdu_push(1)]`;
+  CLI: `emv apdu --host-timeout <ms>`.
+* **APDU push over SPI**: with `apdu_push=1` a relayed APDU is delivered as an unsolicited
+  `HF14A_4_APDU_RECV` frame (IRQ high) instead of being polled. If IRQ is high, read before sending the next command.
+
+Status: builds for nRF52840; not yet verified on hardware or against a real reader.
+
 # ChameleonUltra Authorized Distributors
 
 Lyon, France: [Lab401](https://lab401.com/)

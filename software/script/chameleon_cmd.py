@@ -400,6 +400,18 @@ class ChameleonCMD:
         resp = self.device.send_cmd_sync(Command.HF14A_4_EMV_SCAN, b"", timeout=10)
         return resp
 
+    def hf14a_4_set_host_timeout(self, timeout_ms: int = 0, wtxm: int = 0, apdu_push: bool = False):
+        """
+        Set how long the card keeps the reader waiting (WTX) for the host to answer a
+        relayed APDU; after that the firmware answers 6F00.
+
+        :param timeout_ms: 1..65535 ms, 0 = firmware default (10000)
+        :param wtxm: WTX multiplier requested from the reader, 1..59, 0 = default (59)
+        :param apdu_push: SPI builds only: push relayed APDUs to the host (IRQ pin)
+        """
+        payload = struct.pack(">HBB", timeout_ms, wtxm, 1 if apdu_push else 0)
+        return self.device.send_cmd_sync(Command.HF14A_4_SET_HOST_TIMEOUT, payload)
+
     def hf14a_4_clear_static_responses(self):
         """Clear all static APDU responses from the active HF14A_4 slot."""
         return self.device.send_cmd_sync(Command.HF14A_4_STATIC_RESP, b"\x00")

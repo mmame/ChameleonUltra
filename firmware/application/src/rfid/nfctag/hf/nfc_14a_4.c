@@ -17,6 +17,7 @@
 #include "tag_persistence.h"
 #include "fds_util.h"
 #include "nrf_log.h"
+#include "app_timer.h"
 
 /* ------------------------------------------------------------------ */
 /*  PCB byte constants (ISO14443-4 §7)                                 */
@@ -59,6 +60,10 @@ static nfc_tag_14a_4_tcl_state_t m_tcl_session_state;
 
 /* TX scratch buffer */
 static uint8_t m_tx_buf[NFC_14A_4_MAX_APDU + 4];
+
+/* Host relay timing */
+static uint16_t m_host_timeout_ms = NFC_14A_4_DEFAULT_HOST_TIMEOUT_MS;
+static uint8_t  m_wtxm            = NFC_14A_4_DEFAULT_WTXM;
 
 /* Debug counters — readable via hf 14a debug */
 static uint8_t  m_dbg_iblocks_rx  = 0;  /* I-blocks received */
@@ -181,7 +186,7 @@ static void send_wtx(nfc_tag_14a_4_tcl_state_t *m_tcl_session_state) {
     uint8_t off = 0;
     buf[off++] = PCB_SBLOCK_WTX | (m_tcl_session_state->m_cid_supported ? PCB_CID_FOLLOWING : 0);
     if (m_tcl_session_state->m_cid_supported) buf[off++] = m_tcl_session_state->m_cid & 0x0F;
-    buf[off++] = WTX_VALUE;
+    buf[off++] = m_wtxm;
     nfc_tag_14a_tx_bytes(buf, off, true);
 }
 
@@ -212,8 +217,27 @@ bool nfc_tag_14a_4_base_handler(nfc_tag_14a_4_tcl_state_t *m_tcl_session_state, 
             return false;
         }
         if ((pcb & 0x3F) == (PCB_SBLOCK_WTX & 0x3F)) {
+            if (m_tcl_session_state->m_waiting_host) {
+                /* Reader acknowledged our WTX request: send the host response, or keep
+                 * waiting with another WTX until the host timeout expires. */
+                if (!m_tcl_session_state->m_response_ready) {
+                    uint32_t elapsed = app_timer_cnt_diff_compute(app_timer_cnt_get(), m_tcl_session_state->m_wait_start);
+                    if (elapsed >= APP_TIMER_TICKS(m_host_timeout_ms)) {
+                        m_tcl_session_state->m_resp_buf[0] = 0x6F;
+                        m_tcl_session_state->m_resp_buf[1] = 0x00;
+                        m_tcl_session_state->m_resp_len = 2;
+                        m_tcl_session_state->m_response_ready = true;
+                        NRF_LOG_WARNING("14A4: host APDU timeout");
+                    }
+                }
+                if (m_tcl_session_state->m_response_ready) {
+                    m_tcl_session_state->m_waiting_host = false;
+                }
+                nfc_tag_14a_4_base_respond(m_tcl_session_state);
+                return false;
+            }
             /* Reader sending WTX — echo back with our WTXM */
-            uint8_t wtxm = (szBytes > 1) ? data[szBytes - 1] & 0x3F : WTX_VALUE;
+            uint8_t wtxm = (szBytes > 1) ? data[szBytes - 1] & 0x3F : m_wtxm;
             uint8_t resp[3];
             uint8_t off = 0;
             resp[off++] = PCB_SBLOCK_WTX | (m_tcl_session_state->m_cid_supported ? PCB_CID_FOLLOWING : 0);
@@ -289,6 +313,7 @@ bool nfc_tag_14a_4_base_handler(nfc_tag_14a_4_tcl_state_t *m_tcl_session_state, 
         m_tcl_session_state->m_apdu_len    = apdu_len;
         m_tcl_session_state->m_apdu_pending = true;
         m_tcl_session_state->m_response_ready = false;
+        m_tcl_session_state->m_waiting_host = false;
 
         if (more_chain) {
             send_rack(m_tcl_session_state);
@@ -322,6 +347,9 @@ static void nfc_tag_14a_4_state_handler(uint8_t *data, uint16_t szBytes) {
         memcpy(m_tcl_session_state.m_resp_buf, static_resp, static_len);
         m_tcl_session_state.m_resp_len = static_len;
         m_tcl_session_state.m_response_ready = true;
+    } else {
+        m_tcl_session_state.m_waiting_host = true;
+        m_tcl_session_state.m_wait_start = app_timer_cnt_get();
     }
 
     nfc_tag_14a_4_base_respond(&m_tcl_session_state);
@@ -340,10 +368,19 @@ bool nfc_tag_14a_4_get_pending_apdu(uint8_t *buf, uint16_t *length) {
 }
 
 void nfc_tag_14a_4_set_response(const uint8_t *data, uint16_t length) {
+    // late answers (after the host timeout) must not leak into the next APDU
+    if (!m_tcl_session_state.m_waiting_host) return;
     if (length > NFC_14A_4_MAX_APDU) length = NFC_14A_4_MAX_APDU;
     memcpy(m_tcl_session_state.m_resp_buf, data, length);
     m_tcl_session_state.m_resp_len = length;
     m_tcl_session_state.m_response_ready = true;
+}
+
+void nfc_tag_14a_4_set_host_timeout(uint16_t timeout_ms, uint8_t wtxm) {
+    if (timeout_ms == 0) timeout_ms = NFC_14A_4_DEFAULT_HOST_TIMEOUT_MS;
+    if (wtxm == 0 || wtxm > 59) wtxm = NFC_14A_4_DEFAULT_WTXM;
+    m_host_timeout_ms = timeout_ms;
+    m_wtxm = wtxm;
 }
 
 /* ------------------------------------------------------------------ */
@@ -356,7 +393,7 @@ void nfc_tag_14a_4_reset_state(nfc_tag_14a_4_tcl_state_t *m_tcl_session_state) {
     m_tcl_session_state->m_cid            = 0;
     m_tcl_session_state->m_apdu_pending   = false;
     m_tcl_session_state->m_response_ready = false;
-    m_tcl_session_state->m_apdu_len       = 0;
+    m_tcl_session_state->m_waiting_host   = false;
     m_tcl_session_state->m_resp_len       = 0;
 }
 

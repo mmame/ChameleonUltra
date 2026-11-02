@@ -10420,6 +10420,14 @@ class EMVApdu(DeviceRequiredUnit):
             metavar="<ms>",
             help="Total relay timeout in ms (default: 15000)",
         )
+        parser.add_argument(
+            "--host-timeout",
+            type=int,
+            default=None,
+            metavar="<ms>",
+            help="How long the card keeps the reader waiting for your answer before "
+            "replying 6F00 (firmware default: 10000)",
+        )
         return parser
 
     def on_exec(self, args: argparse.Namespace):
@@ -10427,8 +10435,8 @@ class EMVApdu(DeviceRequiredUnit):
 
         cmd = self.cmd
         timeout_ms = max(1000, min(60000, args.timeout))
-
-        print(f" {CY}ISO14443-4 T=CL APDU relay started{C0}")
+        if args.host_timeout is not None:
+            cmd.hf14a_4_set_host_timeout(max(1, min(65535, args.host_timeout)))
         print(" Waiting for a reader to connect (SAK=20 slot required)...")
         print(f" Type {CY}quit{C0} to exit, or enter hex response bytes when prompted.")
 

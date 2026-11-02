@@ -382,6 +382,21 @@ else
 $(error Chameleon <Application>: No device type define.)
 endif
 
+# Additional SPI slave transport (host MCU, e.g. ESP32, controls the device); USB/BLE stay active.
+# Build with: make SPI_TRANSPORT=1 [SPI_NO_SLEEP=1 to never enter System OFF]
+ifeq (${SPI_TRANSPORT}, 1)
+SRC_FILES += \
+  $(PROJ_DIR)/spi_main.c \
+  $(SDK_ROOT)/modules/nrfx/drivers/src/nrfx_spis.c
+
+CFLAGS += -DCHAMELEON_SPI_TRANSPORT -DSPIS_ENABLED=1 -DSPIS2_ENABLED=1
+$(info  Chameleon <Application>: SPI transport enable.)
+endif
+
+ifeq (${SPI_NO_SLEEP}, 1)
+CFLAGS += -DSPI_NO_SYSTEM_OFF
+endif
+
 ifeq (${NRF_LOG_UART_ON_SWO_ENABLED}, 1)
 SRC_FILES += \
   $(SDK_ROOT)/components/libraries/log/src/nrf_log_backend_uart.c \

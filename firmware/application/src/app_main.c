@@ -39,6 +39,9 @@ NRF_LOG_MODULE_REGISTER();
 #include "syssleep.h"
 #include "tag_emulation.h"
 #include "usb_main.h"
+#ifdef CHAMELEON_SPI_TRANSPORT
+#include "spi_main.h"
+#endif
 #include "rgb_marquee.h"
 #include "tag_persistence.h"
 #include "settings.h"
@@ -297,7 +300,7 @@ static void button_init(void) {
 
 /**@brief The implementation function to enter deep hibernation
  */
-static void system_off_enter(void) {
+static void __attribute__((unused)) system_off_enter(void) {
     ret_code_t ret;
     m_system_off_processing = true;
     // Save tag data
@@ -1131,6 +1134,11 @@ static void ble_passkey_init(void) {
 
 /**@brief Application main function.
  */
+#ifdef SPI_NO_SYSTEM_OFF
+static void spi_no_system_off(void) {
+}
+#endif
+
 int main(void) {
     hw_connect_init();        // Remember to initialize the pins first
 
@@ -1143,6 +1151,9 @@ int main(void) {
     app_timers_init();        // Initialize soft timer
     power_management_init();  // Power management initialization
     usb_cdc_init();           // USB cdc emulation initialization
+#ifdef CHAMELEON_SPI_TRANSPORT
+    spi_slave_init();         // SPI slave transport initialization
+#endif
     ble_slave_init();         // Bluetooth protocol stack initialization
 
     rng_drv_and_srand_init(); // Random number generator initialization
@@ -1187,6 +1198,9 @@ int main(void) {
         }
 
         // Data pack process
+#ifdef CHAMELEON_SPI_TRANSPORT
+        spi_slave_process();
+#endif
         data_frame_process();
         // Log print process
         while (NRF_LOG_PROCESS());
@@ -1197,6 +1211,11 @@ int main(void) {
         // No task to process, system sleep enter.
         // If system idle sometime, we can enter deep sleep state.
         // Some task process done, we can enter cpu sleep state.
+#ifdef SPI_NO_SYSTEM_OFF
+        // SPI cannot wake the chip from System OFF, so never power off.
+        sleep_system_run(spi_no_system_off, nrf_pwr_mgmt_run);
+#else
         sleep_system_run(system_off_enter, nrf_pwr_mgmt_run);
+#endif
     }
 }
