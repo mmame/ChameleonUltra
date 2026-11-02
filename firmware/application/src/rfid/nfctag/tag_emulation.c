@@ -82,6 +82,13 @@ static tag_slot_config_t slotConfig ALIGN_U32 = {
 // The card slot configuration unique CRC, once the slot configuration changes, can be checked by CRC
 static uint16_t m_slot_config_crc;
 
+static bool m_volatile_emulation;
+static tag_slot_config_t m_saved_slot_config;
+static uint8_t m_saved_hf_buffer[sizeof(m_tag_data_buffer_hf)];
+static uint8_t m_saved_lf_buffer[sizeof(m_tag_data_buffer_lf)];
+static uint16_t m_saved_hf_crc;
+static uint16_t m_saved_lf_crc;
+
 // ********************** Specific parameter ends **********************
 
 /**
@@ -331,6 +338,7 @@ void tag_emulation_load_data(void) {
  *Save the emulated card configuration data. At the right time, this function should be called for data preservation of data
  */
 void tag_emulation_save_data(void) {
+    if (m_volatile_emulation) return;
     uint8_t slot = tag_emulation_get_slot();
     save_data_by_tag_type(slot, slotConfig.slots[slot].tag_hf);
     save_data_by_tag_type(slot, slotConfig.slots[slot].tag_lf);
@@ -382,12 +390,80 @@ bool tag_emulation_factory_data(uint8_t slot, tag_specific_type_t tag_type) {
     // The process of implementing the data formatting data!
     if (factory != NULL && factory(slot, tag_type)) {
         // If the current data card slot number currently set is the current activated card slot, then we need to update to the memory
-        if (tag_emulation_get_slot() == slot) {
+        if (tag_emulation_get_slot() == slot && !m_volatile_emulation) {
             load_data_by_tag_type(slot, tag_type);
         }
         return true;
     }
     return false;
+}
+
+bool tag_emulation_factory_write(uint8_t slot, tag_specific_type_t tag_type, const void *data, uint16_t length) {
+    if (m_volatile_emulation) {
+        if (slot != slotConfig.active_slot || tag_type != slotConfig.slots[slot].tag_hf ||
+                length > sizeof(m_tag_data_buffer_hf)) {
+            return false;
+        }
+        memset(m_tag_data_buffer_hf, 0, sizeof(m_tag_data_buffer_hf));
+        memcpy(m_tag_data_buffer_hf, data, length);
+        return tag_emulation_load_by_buffer(tag_type, true);
+    }
+    fds_slot_record_map_t map_info;
+    get_fds_map_by_slot_sense_type_for_dump(slot, get_sense_type_from_tag_type(tag_type), &map_info);
+    return fds_write_sync(map_info.id, map_info.key, length, (void *)data);
+}
+
+bool tag_emulation_volatile_begin(tag_specific_type_t tag_type) {
+    switch (tag_type) {
+        case TAG_TYPE_MIFARE_Mini:
+        case TAG_TYPE_MIFARE_1024:
+        case TAG_TYPE_MIFARE_2048:
+        case TAG_TYPE_MIFARE_4096:
+        case TAG_TYPE_NTAG_210:
+        case TAG_TYPE_NTAG_212:
+        case TAG_TYPE_NTAG_213:
+        case TAG_TYPE_NTAG_215:
+        case TAG_TYPE_NTAG_216:
+        case TAG_TYPE_MF0ICU1:
+        case TAG_TYPE_MF0ICU2:
+        case TAG_TYPE_MF0UL11:
+        case TAG_TYPE_MF0UL21:
+            break;
+        default:
+            return false;
+    }
+    tag_emulation_sense_end();
+    tag_emulation_volatile_end();
+    m_saved_slot_config = slotConfig;
+    memcpy(m_saved_hf_buffer, m_tag_data_buffer_hf, sizeof(m_saved_hf_buffer));
+    memcpy(m_saved_lf_buffer, m_tag_data_buffer_lf, sizeof(m_saved_lf_buffer));
+    m_saved_hf_crc = m_tag_data_hf_crc;
+    m_saved_lf_crc = m_tag_data_lf_crc;
+    m_volatile_emulation = true;
+    uint8_t slot = slotConfig.active_slot;
+    slotConfig.slots[slot].tag_hf = tag_type;
+    slotConfig.slots[slot].enabled_hf = true;
+    slotConfig.slots[slot].enabled_lf = false;
+    if (!tag_emulation_factory_data(slot, tag_type)) {
+        tag_emulation_volatile_end();
+        return false;
+    }
+    return true;
+}
+
+void tag_emulation_volatile_end(void) {
+    if (!m_volatile_emulation) return;
+    tag_emulation_sense_end();
+    slotConfig = m_saved_slot_config;
+    memcpy(m_tag_data_buffer_hf, m_saved_hf_buffer, sizeof(m_tag_data_buffer_hf));
+    memcpy(m_tag_data_buffer_lf, m_saved_lf_buffer, sizeof(m_tag_data_buffer_lf));
+    m_tag_data_hf_crc = m_saved_hf_crc;
+    m_tag_data_lf_crc = m_saved_lf_crc;
+    uint8_t slot = slotConfig.active_slot;
+    tag_emulation_load_by_buffer(slotConfig.slots[slot].tag_hf, false);
+    tag_emulation_load_by_buffer(slotConfig.slots[slot].tag_lf, false);
+    m_volatile_emulation = false;
+    g_is_tag_emulating = false;
 }
 
 /**
@@ -522,6 +598,7 @@ static void tag_emulation_load_config(void) {
  * Save the emulated card configuration data
  */
 static void tag_emulation_save_config(void) {
+    if (m_volatile_emulation) return;
     // We are configured the card slot configuration, and we need to calculate the current card slot configuration CRC code to judge whether the data below is updated
     uint16_t new_calc_crc;
     calc_14a_crc_lut((uint8_t *)&slotConfig, sizeof(slotConfig), (uint8_t *)&new_calc_crc);
@@ -590,6 +667,7 @@ void tag_emulation_set_slot(uint8_t index) {
  * Switch to the card slot of the specified index, this function will automatically complete the data loading
  */
 void tag_emulation_change_slot(uint8_t index, bool sense_disable) {
+    tag_emulation_volatile_end();
     if (sense_disable) {
         // Turn off the analog card to avoid triggering the emulation when switching the card slot
         tag_emulation_sense_end();
@@ -667,6 +745,7 @@ uint8_t tag_emulation_slot_find_prev(uint8_t slot_now) {
  * Set the card specified by the specified card slot card slot card type card to the specified type
  */
 void tag_emulation_change_type(uint8_t slot, tag_specific_type_t tag_type) {
+    tag_emulation_volatile_end();
     tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
     NRF_LOG_INFO("sense type = %d", sense_type);
     switch (sense_type) {

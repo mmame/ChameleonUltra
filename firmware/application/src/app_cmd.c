@@ -1,6 +1,7 @@
 #include "fds_util.h"
 #include "bsp_time.h"
 #include "bsp_delay.h"
+#include "app_timer.h"
 #include "usb_main.h"
 #include "rfid_main.h"
 #include "ble_main.h"
@@ -303,8 +304,9 @@ static data_frame_tx_t *cmd_processor_hf14a_scan(uint16_t cmd, uint16_t status, 
 }
 
 static data_frame_tx_t *cmd_processor_mf1_detect_support(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
-    status = check_std_mifare_nt_support();
-    return data_frame_make(cmd, status, 0, NULL);
+    uint8_t diagnostics[6];
+    status = check_std_mifare_nt_support(diagnostics);
+    return data_frame_make(cmd, status, sizeof(diagnostics), diagnostics);
 }
 
 static data_frame_tx_t *cmd_processor_mf1_detect_prng(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
@@ -1123,6 +1125,18 @@ static data_frame_tx_t *cmd_processor_generic_read(uint16_t cmd, uint16_t status
 
 #endif
 
+
+static data_frame_tx_t *cmd_processor_hf_volatile_begin(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 2) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    tag_specific_type_t tag_type = (tag_specific_type_t)(((uint16_t)data[0] << 8) | data[1]);
+    return data_frame_make(cmd, tag_emulation_volatile_begin(tag_type) ? STATUS_SUCCESS : STATUS_PAR_ERR, 0, NULL);
+}
+
+static data_frame_tx_t *cmd_processor_hf_volatile_end(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length != 0) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    tag_emulation_volatile_end();
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
 
 static data_frame_tx_t *cmd_processor_set_active_slot(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     if (length != 1 || data[0] >= TAG_MAX_SLOT_NUM) {
@@ -2089,9 +2103,23 @@ static data_frame_tx_t *before_reader_run(uint16_t cmd, uint16_t status, uint16_
  * before reader run, reset reader and on antenna,
  * we must to wait some time, to init picc(power).
  */
+static int8_t m_classic_saved_rats;
+
+static bool is_classic_reader_command(uint16_t cmd) {
+    return (cmd >= DATA_CMD_MF1_DETECT_SUPPORT && cmd <= DATA_CMD_MF1_WRITE_ONE_BLOCK) ||
+           (cmd >= DATA_CMD_MF1_MANIPULATE_VALUE_BLOCK && cmd <= DATA_CMD_MF1_CHECK_KEYS_ON_BLOCK);
+}
+
 static data_frame_tx_t *before_hf_reader_run(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     data_frame_tx_t *ret = before_reader_run(cmd, status, length, data);
     if (ret == NULL) {
+        if (is_classic_reader_command(cmd)) {
+            hf14a_config_t config = *get_hf14a_config();
+            m_classic_saved_rats = config.forcerats;
+            // RATS switches dual-interface SmartMX cards away from Classic authentication.
+            config.forcerats = 2;
+            set_hf14a_config(&config);
+        }
         pcd_14a_reader_reset();
         pcd_14a_reader_antenna_on();
         bsp_delay_ms(8);
@@ -2104,6 +2132,11 @@ static data_frame_tx_t *before_hf_reader_run(uint16_t cmd, uint16_t status, uint
  */
 static data_frame_tx_t *after_hf_reader_run(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
     pcd_14a_reader_antenna_off();
+    if (is_classic_reader_command(cmd)) {
+        hf14a_config_t config = *get_hf14a_config();
+        config.forcerats = m_classic_saved_rats;
+        set_hf14a_config(&config);
+    }
     return NULL;
 }
 
@@ -2806,6 +2839,280 @@ static data_frame_tx_t *cmd_processor_hf14a_4_reader_apdu(uint16_t cmd, uint16_t
     return data_frame_make(cmd, STATUS_HF_TAG_OK, resp_chain_len, resp_chain);
 }
 
+/* AID discovery protocol v1. Request: version, mode (list/range/next/pattern), count,
+ * budget_ms BE16, uid_len, uid, atqa[2], sak, then:
+ * list: (aid_len, aid)*; range: prefix_len, prefix, width(1/2), start BE16;
+ * next: prefix_len, prefix (first SELECT then P2=02 for following occurrences).
+ * pattern: character_count, ASCII hex/X(decimal)/?(hex) pattern, cursor BE32.
+ * Response: version, attempted, stop (0=done,1=time,2=RF,3=space), records,
+ * followed by (candidate_index, response_len BE16, response)*.
+ * Ordinary not-found responses are counted but omitted. Each batch reactivates
+ * and verifies the expected card; no scan state survives the command.
+ */
+static bool aid_scan_frame(uint8_t *tx, uint8_t tx_len, uint8_t *rx, uint16_t *rx_len,
+                           uint32_t start, uint16_t budget) {
+    for (uint8_t wtx = 0; wtx < 16; wtx++) {
+        uint32_t elapsed = app_timer_cnt_diff_compute(app_timer_cnt_get(), start);
+        if (elapsed >= APP_TIMER_TICKS(budget)) return false;
+        uint32_t remaining = APP_TIMER_TICKS(budget) - elapsed;
+        uint16_t timeout = remaining * 1000u / APP_TIMER_CLOCK_FREQ;
+        if (!timeout) return false;
+        if (timeout > 600) timeout = 600;
+        bsp_wdt_feed();
+        crc_14a_append(tx, tx_len);
+        write_register_single(CommandReg, PCD_IDLE);
+        write_register_single(ComIrqReg, 0x7F);
+        set_register_mask(FIFOLevelReg, 0x80);
+        clear_register_mask(BitFramingReg, 0x80);
+        pcd_14a_reader_timeout_set(timeout);
+        uint16_t bits = 0;
+        uint8_t st = pcd_14a_reader_bytes_transfer(PCD_TRANSCEIVE, tx, tx_len + 2,
+                                                 rx, &bits, 64u * 8u);
+        if (st != STATUS_HF_TAG_OK || bits < 24 || bits % 8) return false;
+        uint16_t size = bits / 8;
+        uint8_t crc[2];
+        crc_14a_calculate(rx, size - 2, crc);
+        if (rx[size - 2] != crc[0] || rx[size - 1] != crc[1]) return false;
+        *rx_len = size - 2;
+        if (rx[0] != 0xF2) return true;
+        if (*rx_len != 2 || rx[1] < 1 || rx[1] > 59) return false;
+        tx[0] = 0xF2;
+        tx[1] = rx[1];
+        tx_len = 2;
+    }
+    return false;
+}
+
+static bool aid_scan_apdu(const uint8_t *apdu, uint8_t len, uint8_t fragment,
+                          uint8_t *tx_number, uint8_t *rx_number,
+                          uint8_t *out, uint16_t *out_len, uint32_t start, uint16_t budget) {
+    uint8_t tx[64], rx[64];
+    uint16_t rx_len = 0;
+    for (uint8_t pos = 0; pos < len;) {
+        uint8_t n = len - pos;
+        if (n > fragment) n = fragment;
+        bool more = pos + n < len;
+        tx[0] = 0x02 | *tx_number | (more ? 0x10 : 0);
+        memcpy(tx + 1, apdu + pos, n);
+        if (!aid_scan_frame(tx, n + 1, rx, &rx_len, start, budget)) return false;
+        *tx_number ^= 1;
+        pos += n;
+        if (more && (rx_len != 1 || rx[0] != (0xA2 | *tx_number))) return false;
+    }
+    *out_len = 0;
+    for (uint8_t chain = 0; chain < 64; chain++) {
+        if ((rx[0] & 0xEE) != 0x02 || (rx[0] & 1) != *rx_number ||
+                *out_len + rx_len - 1 > 512) return false;
+        memcpy(out + *out_len, rx + 1, rx_len - 1);
+        *out_len += rx_len - 1;
+        *rx_number ^= 1;
+        if (!(rx[0] & 0x10)) return *out_len >= 2;
+        tx[0] = 0xA2 | *rx_number;
+        if (!aid_scan_frame(tx, 1, rx, &rx_len, start, budget)) return false;
+    }
+    return false;
+}
+
+static bool aid_scan_select(const uint8_t *aid, uint8_t len, uint8_t p2, uint8_t fragment,
+                            uint8_t *tx_number, uint8_t *rx_number,
+                            uint8_t *result, uint16_t *result_len, uint32_t start, uint16_t budget) {
+    uint8_t apdu[22] = {0, 0xA4, 4, p2, len};
+    memcpy(apdu + 5, aid, len);
+    uint8_t apdu_len = len + 6;
+    apdu[apdu_len - 1] = 0;
+    uint8_t response[512];
+    *result_len = 0;
+    for (uint8_t continuation = 0; continuation < 8; continuation++) {
+        uint16_t n = 0;
+        if (!aid_scan_apdu(apdu, apdu_len, fragment, tx_number, rx_number,
+                           response, &n, start, budget)) return false;
+        if (response[n - 2] == 0x6C) {
+            apdu[apdu_len - 1] = response[n - 1];
+            continue;
+        }
+        if (*result_len + n > 512) return false;
+        memcpy(result + *result_len, response, n);
+        *result_len += n;
+        if (response[n - 2] != 0x61) return true;
+        *result_len -= 2;
+        apdu[0] = 0;
+        apdu[1] = 0xC0;
+        apdu[2] = apdu[3] = 0;
+        apdu[4] = response[n - 1];
+        apdu_len = 5;
+    }
+    return false;
+}
+
+static bool aid_scan_pattern(const uint8_t *pattern, uint8_t chars, uint32_t cursor, uint8_t *aid) {
+    memset(aid, 0, chars / 2);
+    for (int i = chars - 1; i >= 0; i--) {
+        uint8_t c = pattern[i], nibble;
+        if (c == 'X' || c == '?') {
+            uint8_t radix = c == 'X' ? 10 : 16;
+            nibble = cursor % radix;
+            cursor /= radix;
+        } else if (c >= '0' && c <= '9') {
+            nibble = c - '0';
+        } else if (c >= 'A' && c <= 'F') {
+            nibble = c - 'A' + 10;
+        } else {
+            return false;
+        }
+        aid[i / 2] |= nibble << (i % 2 ? 0 : 4);
+    }
+    return cursor == 0;
+}
+
+static data_frame_tx_t *cmd_processor_hf14a_aid_scan(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    if (length < 15 || data[0] != 1 || data[1] > 3 || !data[2] || data[2] > 64 ||
+            (data[1] == 2 && data[2] > 16)) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t budget = ((uint16_t)data[3] << 8) | data[4];
+    uint8_t uid_len = data[5];
+    uint16_t pos = 6 + uid_len + 3;
+    if (budget < 100 || budget > 3000 || (uid_len != 4 && uid_len != 7 && uid_len != 10) || pos >= length) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint16_t body = pos;
+    uint8_t width = 0;
+    uint16_t first = 0;
+    uint32_t cursor = 0;
+    if (data[1] == 0) {
+        for (uint8_t i = 0; i < data[2]; i++) {
+            if (pos >= length || data[pos] < 5 || data[pos] > 16 || pos + 1 + data[pos] > length) {
+                return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+            }
+            pos += 1 + data[pos];
+        }
+    } else if (data[1] == 3) {
+        uint8_t chars = data[pos++];
+        if (chars < 10 || chars > 32 || chars % 2 || pos + chars + 4 != length) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+        uint16_t at = pos + chars;
+        cursor = ((uint32_t)data[at] << 24) | ((uint32_t)data[at + 1] << 16) |
+                 ((uint32_t)data[at + 2] << 8) | data[at + 3];
+        uint8_t aid[16];
+        uint64_t last = (uint64_t)cursor + data[2] - 1;
+        if (last > UINT32_MAX || !aid_scan_pattern(data + pos, chars, (uint32_t)last, aid)) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+        pos = length;
+    } else {
+        uint8_t n = data[pos++];
+        uint8_t extra = data[1] == 1 ? 3 : 0;
+        if (n < 5 || n > 16 || pos + n + extra != length) {
+            return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+        }
+        pos += n;
+        if (data[1] == 1) {
+            width = data[pos++];
+            first = ((uint16_t)data[pos] << 8) | data[pos + 1];
+            if ((width != 1 && width != 2) || n + width > 16 ||
+                    (uint32_t)first + data[2] > (width == 1 ? 256u : 65536u)) {
+                return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+            }
+            pos += 2;
+        }
+    }
+    if (pos != length) return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+
+    static uint8_t out[NETDATA_MAX_DATA_LENGTH];
+    uint16_t out_len = 4;
+    out[0] = 1;
+    out[1] = out[2] = out[3] = 0;
+    uint32_t start = app_timer_cnt_get();
+    hf14a_config_t config = *get_hf14a_config();
+    hf14a_config_t saved = config;
+    config.forcerats = 0;
+    set_hf14a_config(&config);
+    pcd_14a_reader_antenna_off();
+    bsp_delay_ms(50);
+    pcd_14a_reader_reset();
+    pcd_14a_reader_antenna_on();
+    bsp_delay_ms(8);
+    pcd_14a_reader_timeout_set(100);
+    picc_14a_tag_t tag;
+    status = pcd_14a_reader_scan_auto(&tag);
+    if (status != STATUS_HF_TAG_OK) goto aid_scan_done;
+    if (tag.uid_len != uid_len || memcmp(tag.uid, data + 6, uid_len) ||
+            memcmp(tag.atqa, data + 6 + uid_len, 2) || tag.sak != data[8 + uid_len]) {
+        status = STATUS_HF_ERR_STAT;
+        goto aid_scan_done;
+    }
+    static const uint16_t sizes[] = {16, 24, 32, 40, 48, 64, 96, 128, 256};
+    if (!(tag.sak & 0x20) || tag.ats_len < 2 || (tag.ats[1] & 15) > 8) {
+        status = STATUS_HF_ERR_ATS;
+        goto aid_scan_done;
+    }
+    uint8_t fragment = sizes[tag.ats[1] & 15] > 64 ? 61 : sizes[tag.ats[1] & 15] - 3;
+    uint8_t tx_number = 0, rx_number = 0, misses = 0;
+    uint32_t last_duration = 0;
+    pos = body;
+    bsp_delay_ms(5);
+    for (uint8_t i = 0; i < data[2]; i++) {
+        uint32_t elapsed = app_timer_cnt_diff_compute(app_timer_cnt_get(), start);
+        /* Do not begin another slow SELECT if the previous one would not fit. */
+        if (elapsed + last_duration + APP_TIMER_TICKS(5) >= APP_TIMER_TICKS(budget)) {
+            out[2] = 1;
+            break;
+        }
+        /* Reserve room for the largest complete response before trying a candidate. */
+        if (out_len + 3 + 512 > sizeof(out)) {
+            out[2] = 3;
+            break;
+        }
+        uint8_t aid[16], n = data[pos];
+        if (data[1] == 3) {
+            aid_scan_pattern(data + pos + 1, n, cursor + i, aid);
+            n /= 2;
+        } else {
+            memcpy(aid, data + pos + 1, n);
+        }
+        if (data[1] == 0) {
+            pos += 1 + n;
+        } else if (data[1] == 1) {
+            uint16_t suffix = first + i;
+            if (width == 2) aid[n++] = suffix >> 8;
+            aid[n++] = suffix & 255;
+        }
+        uint8_t response[512];
+        uint16_t response_len = 0;
+        uint8_t p2 = data[1] == 2 && i ? 2 : 0;
+        uint32_t query_start = app_timer_cnt_get();
+        if (!aid_scan_select(aid, n, p2, fragment, &tx_number, &rx_number,
+                             response, &response_len, start, budget)) {
+            elapsed = app_timer_cnt_diff_compute(app_timer_cnt_get(), start);
+            out[2] = elapsed + APP_TIMER_TICKS(20) >= APP_TIMER_TICKS(budget) ? 1 : 2;
+            break;
+        }
+        last_duration = app_timer_cnt_diff_compute(app_timer_cnt_get(), query_start);
+        out[1]++;
+        uint16_t sw = ((uint16_t)response[response_len - 2] << 8) | response[response_len - 1];
+        if (sw == 0x6A82 || sw == 0x6A86 || sw == 0x6D00 || sw == 0x6E00) {
+            if (++misses == 50) {
+                bsp_delay_ms(10);
+                misses = 0;
+            }
+            if (data[1] == 2) break;
+            continue;
+        }
+        out[out_len++] = i;
+        out[out_len++] = response_len >> 8;
+        out[out_len++] = response_len & 255;
+        memcpy(out + out_len, response, response_len);
+        out_len += response_len;
+        out[3]++;
+    }
+aid_scan_done:
+    pcd_14a_reader_antenna_off();
+    pcd_14a_reader_timeout_set(DEF_COM_TIMEOUT);
+    set_hf14a_config(&saved);
+    return data_frame_make(cmd, status, status == STATUS_HF_TAG_OK ? out_len : 0, out);
+}
+
 /* -----------------------------------------------------------------------
  * tcl_apdu_: ISO 14443-4 APDU helper used by cmd_processor_hf14a_4_emv_scan.
  * Sends one I-block, receives full response handling card-side chaining.
@@ -3243,6 +3550,8 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_CHANGE_DEVICE_MODE,           NULL,                        cmd_processor_change_device_mode,            NULL                   },
     {    DATA_CMD_GET_DEVICE_MODE,              NULL,                        cmd_processor_get_device_mode,               NULL                   },
     {    DATA_CMD_SET_ACTIVE_SLOT,              NULL,                        cmd_processor_set_active_slot,               NULL                   },
+    {    DATA_CMD_HF_VOLATILE_BEGIN,            NULL,                        cmd_processor_hf_volatile_begin,             NULL                   },
+    {    DATA_CMD_HF_VOLATILE_END,              NULL,                        cmd_processor_hf_volatile_end,               NULL                   },
     {    DATA_CMD_SET_SLOT_TAG_TYPE,            NULL,                        cmd_processor_set_slot_tag_type,             NULL                   },
     {    DATA_CMD_SET_SLOT_DATA_DEFAULT,        NULL,                        cmd_processor_set_slot_data_default,         NULL                   },
     {    DATA_CMD_SET_SLOT_ENABLE,              NULL,                        cmd_processor_set_slot_enable,               NULL                   },
@@ -3410,6 +3719,7 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_HF14A_4_SET_ANTI_COLL,          NULL,                        cmd_processor_hf14a_4_set_anti_coll,         NULL                   },
     {    DATA_CMD_HF14A_4_STATIC_RESP,            NULL,                        cmd_processor_hf14a_4_static_resp,           NULL                   },
     {    DATA_CMD_HF14A_4_READER_APDU,            before_hf_reader_run,        cmd_processor_hf14a_4_reader_apdu,           NULL                   },
+    {    DATA_CMD_HF14A_AID_SCAN,                 before_reader_run,           cmd_processor_hf14a_aid_scan,               NULL                   },
     {    DATA_CMD_HF14A_4_EMV_SCAN,               before_hf_reader_run,        cmd_processor_hf14a_4_emv_scan,              NULL                   },
     {    DATA_CMD_HF14A_4_SET_HOST_TIMEOUT,       NULL,                        cmd_processor_hf14a_4_set_host_timeout,      NULL                   },
     {    6010,                                     NULL,                        cmd_processor_hf14a_4_debug_counters,        NULL                   },

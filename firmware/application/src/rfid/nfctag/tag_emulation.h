@@ -90,6 +90,9 @@ void tag_emulation_sense_switch(tag_sense_type_t type, bool enable);
 void tag_emulation_delete_data(uint8_t slot, tag_sense_type_t sense_type);
 // Initial data of the factory data of the specified card slot into the factory of the specified type of card
 bool tag_emulation_factory_data(uint8_t slot, tag_specific_type_t tag_type);
+bool tag_emulation_volatile_begin(tag_specific_type_t tag_type);
+void tag_emulation_volatile_end(void);
+bool tag_emulation_factory_write(uint8_t slot, tag_specific_type_t tag_type, const void *data, uint16_t length);
 // Change the type of the card that is being emulated
 void tag_emulation_change_type(uint8_t slot, tag_specific_type_t tag_type);
 // Load the data from the memory to the emulation card buffer

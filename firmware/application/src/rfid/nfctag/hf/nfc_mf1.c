@@ -1341,12 +1341,9 @@ bool nfc_tag_mf1_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
     p_mf1_information->config.reserved3 = 0x00;
 
     // save data to flash
-    tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
-    fds_slot_record_map_t map_info;
-    get_fds_map_by_slot_sense_type_for_dump(slot, sense_type, &map_info);
     int info_size = get_information_size_by_tag_type(tag_type);
     NRF_LOG_INFO("MF1 info size: %d", info_size);
-    bool ret = fds_write_sync(map_info.id, map_info.key, info_size, p_mf1_information);
+    bool ret = tag_emulation_factory_write(slot, tag_type, p_mf1_information, info_size);
     if (ret) {
         NRF_LOG_INFO("Factory slot data success.");
     } else {

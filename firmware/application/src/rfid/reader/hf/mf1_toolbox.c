@@ -576,7 +576,7 @@ void antenna_switch_delay(uint32_t delay_ms) {
 *              If it is not supported, returns the corresponding error code
 *
 */
-uint8_t check_tag_response_nt(picc_14a_tag_t *tag, uint32_t *nt) {
+static uint8_t check_tag_response_nt_detail(picc_14a_tag_t *tag, uint32_t *nt, uint8_t *diagnostics) {
     struct Crypto1State mpcs            = { 0, 0 };
     struct Crypto1State *pcs            = &mpcs;
     uint8_t par_recv[4]                 = { 0x00 };
@@ -587,19 +587,35 @@ uint8_t check_tag_response_nt(picc_14a_tag_t *tag, uint32_t *nt) {
     pcd_14a_reader_halt_tag();
 
     // We will choose a fast card, and we will be compressed to verify as much as possible
-    if (pcd_14a_reader_fast_select(tag) != STATUS_HF_TAG_OK) {
+    status = pcd_14a_reader_fast_select(tag);
+    if (diagnostics != NULL) {
+        diagnostics[1] = 1;
+        diagnostics[2] = status;
+    }
+    if (status != STATUS_HF_TAG_OK) {
         NRF_LOG_INFO("Tag can't select\r\n");
         return STATUS_HF_TAG_NO;
     }
 
     // Send instructions and get NT return
     *nt = send_cmd(pcs, AUTH_FIRST, PICC_AUTHENT1A, 0x03, &status, dat_recv, par_recv, U8ARR_BIT_LEN(dat_recv));
+    if (diagnostics != NULL) {
+        diagnostics[1] = 2;
+        diagnostics[2] = status;
+        diagnostics[3] = (*nt >> 8) & 0xFF;
+        diagnostics[4] = *nt & 0xFF;
+        diagnostics[5] = *nt == 4 ? dat_recv[0] & 0x0F : 0;
+    }
     if (*nt != 32) {
         // NRF_LOG_INFO("No 32 data recv on send_cmd: %d\n", *nt);
         return STATUS_HF_ERR_STAT;
     }
     *nt = bytes_to_num(dat_recv, 4);
     return STATUS_HF_TAG_OK;
+}
+
+uint8_t check_tag_response_nt(picc_14a_tag_t *tag, uint32_t *nt) {
+    return check_tag_response_nt_detail(tag, nt, NULL);
 }
 
 /**
@@ -610,16 +626,20 @@ uint8_t check_tag_response_nt(picc_14a_tag_t *tag, uint32_t *nt) {
 * Lost card hf_tag_no and wrong status hf_errstat
 *
 */
-uint8_t check_std_mifare_nt_support(void) {
+uint8_t check_std_mifare_nt_support(uint8_t diagnostics[6]) {
     uint32_t nt1 = 0;
 
+    // Version, stage (scan/select/AUTH), radio status, RX bits (BE16), short NAK.
+    memset(diagnostics, 0, 6);
+    diagnostics[0] = 1;
     // Find card, search on the field
-    if (pcd_14a_reader_scan_auto(p_tag_info) != STATUS_HF_TAG_OK) {
+    diagnostics[2] = pcd_14a_reader_scan_auto(p_tag_info);
+    if (diagnostics[2] != STATUS_HF_TAG_OK) {
         return STATUS_HF_TAG_NO;
     }
 
     // Get NT and return status
-    return check_tag_response_nt(p_tag_info, &nt1);
+    return check_tag_response_nt_detail(p_tag_info, &nt1, diagnostics);
 }
 
 /**

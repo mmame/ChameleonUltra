@@ -1383,7 +1383,7 @@ bool nfc_tag_mf0_ntag_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
     if (version_page > 0) {
         uint8_t *version_data = &p_ntag_information->memory[version_page][0];
 
-        switch (m_tag_type) {
+        switch (tag_type) {
             case TAG_TYPE_MF0UL11:
                 version_data[6] = MF0UL11_VERSION_STORAGE_SIZE;
                 version_data[2] = MF0ULx1_VERSION_PRODUCT_TYPE;
@@ -1452,12 +1452,9 @@ bool nfc_tag_mf0_ntag_data_factory(uint8_t slot, tag_specific_type_t tag_type) {
     p_ntag_information->config.detection_enable = false;
 
     // save data to flash
-    tag_sense_type_t sense_type = get_sense_type_from_tag_type(tag_type);
-    fds_slot_record_map_t map_info;
-    get_fds_map_by_slot_sense_type_for_dump(slot, sense_type, &map_info);
     int info_size = get_information_size_by_tag_type(tag_type);
     NRF_LOG_INFO("MF0/NTAG info size: %d", info_size);
-    bool ret = fds_write_sync(map_info.id, map_info.key, info_size, p_ntag_information);
+    bool ret = tag_emulation_factory_write(slot, tag_type, p_ntag_information, info_size);
     if (ret) {
         NRF_LOG_INFO("Factory slot data success.");
     } else {

@@ -196,6 +196,9 @@
 #define DATA_CMD_HF14A_4_READER_APDU            (6004)  /* select+RATS+send APDU, keep field   */
 #define DATA_CMD_HF14A_4_EMV_SCAN               (6005)  /* full EMV scan in one call            */
 #define DATA_CMD_HF14A_4_SET_HOST_TIMEOUT       (6011)  /* host answer timeout, WTXM, SPI APDU push */
+#define DATA_CMD_HF_VOLATILE_BEGIN             (6012)  /* tag type (2, BE); initialize RAM only */
+#define DATA_CMD_HF_VOLATILE_END               (6013)  /* discard RAM tag and restore previous state */
+#define DATA_CMD_HF14A_AID_SCAN                (6014)  /* bounded SELECT-only list/range discovery */
 
 #define DATA_CMD_EM410X_SET_EMU_ID              (5000)
 #define DATA_CMD_EM410X_GET_EMU_ID              (5001)
