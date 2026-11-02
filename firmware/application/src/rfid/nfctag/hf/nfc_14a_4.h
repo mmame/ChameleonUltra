@@ -55,6 +55,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  m_cid;
     uint8_t  m_apdu_buf[NFC_14A_4_MAX_APDU];
     uint16_t m_apdu_len;
+    uint16_t m_chain_len;      /* bytes collected from chained I-blocks */
     bool     m_apdu_pending;
     uint8_t  m_resp_buf[NFC_14A_4_MAX_APDU];
     uint16_t m_resp_len;
@@ -67,8 +68,9 @@ nfc_tag_14a_4_tcl_state_t;
 /* Anti-collision resource — used by get_coll_res_data in app_cmd.c */
 nfc_tag_14a_coll_res_reference_t *nfc_tag_14a_4_get_coll_res(void);
 
-/* Handles the low-level ISO14443-4 communication. Returns true when a complete APDU has been read and is ready for response. */
-bool nfc_tag_14a_4_base_handler(nfc_tag_14a_4_tcl_state_t *m_tcl_session_state, uint8_t *data, uint16_t szBytes);
+/* Handles the low-level ISO14443-4 communication for a raw 14A frame (length in bits, CRC_A included).
+ * Returns true when a complete APDU has been read and is ready for response. */
+bool nfc_tag_14a_4_base_handler(nfc_tag_14a_4_tcl_state_t *m_tcl_session_state, uint8_t *data, uint16_t szBits);
 void nfc_tag_14a_4_base_respond(nfc_tag_14a_4_tcl_state_t *m_tcl_session_state);
 
 /* tag_base_map callbacks */

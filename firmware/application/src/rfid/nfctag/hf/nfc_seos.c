@@ -196,9 +196,9 @@ nfc_tag_14a_coll_res_reference_t *nfc_tag_seos_get_coll_res(void) {
 /*  State handler (called from NFCT ISR on each received frame)        */
 /* ------------------------------------------------------------------ */
 
-static void nfc_tag_seos_state_handler(uint8_t *data, uint16_t szBytes) {
+static void nfc_tag_seos_state_handler(uint8_t *data, uint16_t szBits) {
     // Only continue if we have a full APDU ready
-    if (!nfc_tag_14a_4_base_handler(&m_tcl_session_state, data, szBytes)) return;
+    if (!nfc_tag_14a_4_base_handler(&m_tcl_session_state, data, szBits)) return;
 
     uint8_t *receivedCmd = m_tcl_session_state.m_apdu_buf;
     m_tcl_session_state.m_resp_len = 0;
